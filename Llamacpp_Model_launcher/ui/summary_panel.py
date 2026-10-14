@@ -1,7 +1,8 @@
 # Llamacpp_Model_launcher/ui/summary_panel.py
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
-                             QFormLayout, QRadioButton, QCheckBox, QButtonGroup, QSpinBox, QLineEdit)
+                             QFormLayout, QRadioButton, QCheckBox, QButtonGroup, QSpinBox, QLineEdit,
+                             QComboBox, QScrollArea)
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import pyqtSignal, Qt
 from .styles import PARAMETER_BROWSER_STYLES
@@ -73,8 +74,12 @@ class SummaryPanel(QWidget):
         columns_layout.addWidget(summary_column_widget, 1)
         columns_layout.addWidget(config_column_widget, 1)
         container_layout.addLayout(columns_layout)
-        main_layout.addWidget(main_container)
-        main_layout.addStretch()
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll_area.setWidget(main_container)
+        main_layout.addWidget(scroll_area, 1)
 
         button_layout = QHBoxLayout()
         button_layout.addStretch()
@@ -280,8 +285,57 @@ class SummaryPanel(QWidget):
         layout.addWidget(self.context_input_widget)
         # -----------------------------
 
+        # --- Performance Sweep (Phase 6) ---
+        layout.addWidget(create_heading(
+            "Performance Sweep",
+            "After the offload/context are fixed, benchmark variations of speed-related flags and keep the fastest.\n"
+            "Each candidate is a full load + benchmark, so this adds a few minutes per tested option."))
+        self.sweep_checkbox = QCheckBox("Benchmark variations to find the fastest settings (Phase 6)")
+        self.sweep_checkbox.setChecked(True)
+        layout.addWidget(self.sweep_checkbox)
+
+        self.sweep_options_widget = QWidget()
+        sweep_layout = QVBoxLayout(self.sweep_options_widget)
+        sweep_layout.setContentsMargins(20, 0, 0, 0)
+        sweep_layout.setSpacing(4)
+
+        metric_row = QHBoxLayout()
+        metric_label = QLabel("Rank by:")
+        metric_label.setStyleSheet("color: #A0A0A0; background: transparent;")
+        self.sweep_metric_combo = QComboBox()
+        self.sweep_metric_combo.addItem("Generation speed (TG t/s)", 'tg')
+        self.sweep_metric_combo.addItem("Prompt processing (PP t/s)", 'pp')
+        self.sweep_metric_combo.addItem("Balanced (geometric mean)", 'balanced')
+        self.sweep_metric_combo.setStyleSheet(
+            "QComboBox { background-color: #252930; color: #E0E0E0; border: 1px solid #505660; "
+            "border-radius: 4px; padding: 3px; }")
+        metric_row.addWidget(metric_label)
+        metric_row.addWidget(self.sweep_metric_combo)
+        metric_row.addStretch()
+        sweep_layout.addLayout(metric_row)
+
+        self.sweep_split_checkbox = QCheckBox("Split mode: layer vs tensor (-sm, multi-GPU)")
+        self.sweep_split_checkbox.setToolTip(
+            "'-sm tensor' (new) runs all GPUs in parallel on every layer instead of pipelining layers.\n"
+            "Often much faster with 2+ identical GPUs.")
+        self.sweep_spec_checkbox = QCheckBox("Speculative decoding depth (MTP / draft tokens)")
+        self.sweep_spec_checkbox.setToolTip("Tests --spec-draft-n-max values (and speculative off) when the model\n"
+                                            "has MTP layers or a draft model is configured.")
+        self.sweep_ubatch_checkbox = QCheckBox("Micro-batch size (-ub 256 / 512 / 1024 / 2048)")
+        self.sweep_ubatch_checkbox.setToolTip("Mainly changes prompt processing speed. Larger values use more VRAM.")
+        self.sweep_threads_checkbox = QCheckBox("CPU threads (only with CPU offload)")
+        self.sweep_bs_checkbox = QCheckBox("Backend sampling (-bs, experimental)")
+        for cb in (self.sweep_split_checkbox, self.sweep_spec_checkbox, self.sweep_ubatch_checkbox,
+                   self.sweep_threads_checkbox, self.sweep_bs_checkbox):
+            cb.setChecked(True)
+            cb.setStyleSheet(WIDGET_STYLESHEET)
+            sweep_layout.addWidget(cb)
+        self.sweep_bs_checkbox.setChecked(False)
+        layout.addWidget(self.sweep_options_widget)
+        self.sweep_checkbox.toggled.connect(self.sweep_options_widget.setEnabled)
+
         for widget in [self.goal_perf_radio, self.offload_single_gpu_radio, self.offload_multi_vram_radio,
-                       self.offload_multi_cpu_radio, self.maximize_context_checkbox]:
+                       self.offload_multi_cpu_radio, self.maximize_context_checkbox, self.sweep_checkbox]:
             widget.setStyleSheet(WIDGET_STYLESHEET)
 
         layout.addStretch()
@@ -350,7 +404,15 @@ class SummaryPanel(QWidget):
         if not primary_gpu and gpus:
             primary_gpu = gpus[0]  # Fallback
 
+        has_mtp = data.get('model_has_mtp', False)
+        self.sweep_split_checkbox.setEnabled(len(gpus) > 1)
+        self.sweep_split_checkbox.setChecked(len(gpus) > 1)
+        self.sweep_spec_checkbox.setText("Speculative decoding depth (MTP detected)" if has_mtp
+                                         else "Speculative decoding depth (needs MTP layers or -md)")
+
         add_row(self.model_summary_layout, "Model Architecture", data.get('model_architecture', 'N/A'))
+        add_row(self.model_summary_layout, "MTP Layers", "Yes (speculative decoding without a draft model)"
+                if has_mtp else "No")
         add_row(self.model_summary_layout, "Model Size", f"{data.get('model_size_gb', 'N/A')} GB")
         add_row(self.model_summary_layout, "Model Layers", data.get('model_layers', 'N/A'))
         add_row(self.model_summary_layout, "Model Max Context", f"{data.get('model_max_context', 'N/A'):,}")
@@ -457,6 +519,15 @@ class SummaryPanel(QWidget):
             'ram_floor_mb': ram_floor_mb,
             'target_context': target_context,
             'primary_gpu_id': selected_gpu_button.property("gpu_id") if selected_gpu_button else 0,
-            'selected_optimizations': selected_optimizations
+            'selected_optimizations': selected_optimizations,
+            'sweep': {
+                'enabled': self.sweep_checkbox.isChecked(),
+                'metric': self.sweep_metric_combo.currentData(),
+                'split_mode': self.sweep_split_checkbox.isChecked() and self.sweep_split_checkbox.isEnabled(),
+                'speculative': self.sweep_spec_checkbox.isChecked(),
+                'ubatch': self.sweep_ubatch_checkbox.isChecked(),
+                'threads': self.sweep_threads_checkbox.isChecked(),
+                'backend_sampling': self.sweep_bs_checkbox.isChecked(),
+            },
         }
         self.run_tuning.emit(choices)

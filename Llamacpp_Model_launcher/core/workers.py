@@ -6,13 +6,14 @@ from PyQt6.QtCore import QObject, pyqtSignal
 class ApiRequestWorker(QObject):
     """Worker thread for running API benchmark requests."""
     finished = pyqtSignal()
+    result = pyqtSignal(dict)
 
     def __init__(self, wizard_instance):
         super().__init__()
         self.wizard = wizard_instance
 
     def run(self):
-        self.wizard.run_api_benchmark_requests()
+        self.result.emit(self.wizard.run_api_benchmark_requests())
         self.finished.emit()
 
 

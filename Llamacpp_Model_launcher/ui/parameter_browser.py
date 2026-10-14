@@ -44,8 +44,35 @@ class ParameterBrowser(QWidget):
 
         self.browser_param_rows.clear()
         self._is_ninfer_mode = False  # Default to Llama.cpp mode
+        self._detected_group = None  # Flags found in the installed build but not in parameters_db
+        self._detected_key = None
         for group in LLAMA_CPP_PARAMETERS:
             self._create_group_box(group)
+
+    def set_detected_parameters(self, rows, build_label=''):
+        """Shows flags from the installed llama-server --help that the static database lacks."""
+        key = (build_label, tuple(r['prefix'] for r in rows))
+        if key == self._detected_key:
+            return
+        self._detected_key = key
+        self._detected_group = {
+            "name": f"🔎 Detected in your llama.cpp build{f' ({build_label})' if build_label else ''}",
+            "collapsed": True,
+            "parameters": rows,
+        } if rows else None
+        if not self._is_ninfer_mode:
+            self._rebuild(LLAMA_CPP_PARAMETERS)
+
+    def _rebuild(self, groups):
+        self.browser_param_rows.clear()
+        while self.browser_layout.count():
+            child = self.browser_layout.takeAt(0).widget()
+            if child:
+                child.deleteLater()
+        for group in groups:
+            self._create_group_box(group)
+        if groups is LLAMA_CPP_PARAMETERS and self._detected_group:
+            self._create_group_box(self._detected_group)
 
     def set_mode(self, is_ninfer: bool):
         """Switch between Llama.cpp and NInfer parameter sets.
@@ -57,18 +84,7 @@ class ParameterBrowser(QWidget):
             return  # No change needed
         
         self._is_ninfer_mode = is_ninfer
-        self.browser_param_rows.clear()
-        
-        # Clear existing group boxes
-        while self.browser_layout.count():
-            child = self.browser_layout.takeAt(0).widget()
-            if child:
-                child.deleteLater()
-        
-        # Populate with the correct parameter set
-        params = NINFER_PARAMETERS if is_ninfer else LLAMA_CPP_PARAMETERS
-        for group in params:
-            self._create_group_box(group)
+        self._rebuild(NINFER_PARAMETERS if is_ninfer else LLAMA_CPP_PARAMETERS)
 
     def _create_group_box(self, group_data):
         group_box = QFrame()
@@ -134,6 +150,8 @@ class ParameterBrowser(QWidget):
         elif param_data['type'] == 'select':
             param_input = QComboBox()
             param_input.addItems(param_data['options'])
+            if param_data.get('default') in param_data['options']:
+                param_input.setCurrentText(param_data['default'])
             param_input.setStyleSheet(PARAMETER_BROWSER_STYLES["combo_box"])
             param_input.setMinimumWidth(120)
         else:  # number, text

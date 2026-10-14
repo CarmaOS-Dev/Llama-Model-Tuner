@@ -23,3 +23,6 @@ Llamacpp_Model_launcher/ui/config.ini
 build/
 dist/*.exe
 *.spec
+
+# Local benchmark results
+benchmark_history.jsonl

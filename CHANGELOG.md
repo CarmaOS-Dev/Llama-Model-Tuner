@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.56] - 2026-10-14
+
+### Fixed
+- **Server refused to start after tuning**: the wizard's default `--no-mmap` optimization is rejected by current llama-server builds (`--no-mmap`/`--mmap`/`--mlock` were merged into `-lm/--load-mode`). Now uses `-lm none` or keeps the user's `-lm`
+- **Final benchmark always timed out**: log lines are now timestamp-prefixed, so the anchored `eval time` regex never matched. Benchmarks now read the server API `timings` object
+- **Removed `-cd 4096` draft optimization**: the flag no longer exists
+- **Sweep candidates no longer leak flags** into later tests (losing candidates' keys are explicitly reset)
+
+### Added
+- **Build introspection** (`core/llama_cli.py`): parses `llama-server --help`/`--version`; migrates obsolete flags on load, warns about unrecognised ones, collapses duplicated aliases, and feeds a "Detected in your llama.cpp build" group to the Commands browser
+- **GGUF metadata reader** (`core/gguf_reader.py`): detects MTP layers, MoE experts and draft-model type without launching the server
+- **Tuning Wizard Phase 6 – Performance Sweep**: coordinate-descent benchmark of split mode, speculative depth, `-ub`, threads and backend sampling, ranked by TG, PP or balanced
+- **llama-bench dialog** (`ui/bench_dialog.py`) with sortable results and "Apply Best to Editor"
+- **Benchmark history** (`core/benchmark_history.py`): every result appended to `benchmark_history.jsonl`
+
+### Changed
+- `parameters_db.py` rewritten for llama.cpp build 10903 (14 invalid flags removed, new performance groups, corrected defaults)
+- Benchmark: 1 warm-up + 3 runs, prompt cache disabled, medians of TG/PP and draft acceptance
+- Architecture detection uses GGUF metadata instead of the file name; KV probe forces `-np 1`
+- Templates/examples use `-lm none` instead of `--no-mmap`
+
+> 🤖 All changes implemented by Claude Code (Claude Opus 5.5)
+
 ## [Unreleased]
 
 ### Fixed

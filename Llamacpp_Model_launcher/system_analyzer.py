@@ -6,6 +6,7 @@ import subprocess
 import platform
 
 from Llamacpp_Model_launcher.core.platform_utils import IS_WINDOWS, IS_MACOS, get_subprocess_kwargs
+from Llamacpp_Model_launcher.core.gguf_reader import get_model_features
 
 # --- Optional Dependencies ---
 try:
@@ -235,16 +236,24 @@ class SystemAnalyzer:
                 self.results["model_size_gb"] = round(file_size_bytes / (1024 ** 3), 2)
                 yield f"> Model file size is {self.results['model_size_gb']} GB."
 
-            yield "[ANALYSIS] Determining architecture from filename..."
-            lower_filename = filename.lower()
-
-            if ('moe' in lower_filename or
-                    'mixture' in lower_filename or
-                    'gpt-oss' in lower_filename or
-                    re.search(r'a\d+b', lower_filename)):
-                self.results["model_architecture"] = "Mixture of Experts (MoE)"
+            features = get_model_features(model_path)
+            if features.is_valid:
+                yield "[ANALYSIS] Reading architecture from GGUF metadata..."
+                self.results["model_architecture"] = "Mixture of Experts (MoE)" if features.is_moe else "Dense"
+                self.results["model_has_mtp"] = features.has_mtp
+                yield (f"> GGUF architecture '{features.architecture}': {features.block_count} blocks"
+                       + (f", {features.expert_count} experts ({features.expert_used_count} active)" if features.is_moe else "")
+                       + (f", {features.mtp_layers} MTP layer(s) for speculative decoding" if features.has_mtp else ""))
             else:
-                self.results["model_architecture"] = "Dense"
+                yield "[ANALYSIS] Determining architecture from filename..."
+                lower_filename = filename.lower()
+                if ('moe' in lower_filename or
+                        'mixture' in lower_filename or
+                        'gpt-oss' in lower_filename or
+                        re.search(r'a\d+b', lower_filename)):
+                    self.results["model_architecture"] = "Mixture of Experts (MoE)"
+                else:
+                    self.results["model_architecture"] = "Dense"
 
             yield f"> Model architecture identified as: {self.results['model_architecture']}."
 

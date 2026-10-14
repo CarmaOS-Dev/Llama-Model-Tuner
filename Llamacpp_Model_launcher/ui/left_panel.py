@@ -19,6 +19,7 @@ class LeftPanel(QWidget):
     unload_model_clicked = pyqtSignal()
     tune_model_clicked = pyqtSignal()
     tune_model_cancelled = pyqtSignal()  # NEW signal
+    benchmark_clicked = pyqtSignal()
     exit_clicked = pyqtSignal()
     webui_toggled = pyqtSignal(bool)
     run_tuning_from_summary = pyqtSignal(dict)
@@ -70,6 +71,9 @@ class LeftPanel(QWidget):
         self.unload_button = QPushButton('Unload Model')
         self.tuning_wizard_button = QPushButton("Tune Model")
         self.tuning_wizard_button.setStyleSheet("font-weight: bold;")
+        self.benchmark_button = QPushButton("Benchmark")
+        self.benchmark_button.setToolTip("Run a llama-bench sweep (pp/tg t/s) for the selected model")
+        self.benchmark_button.clicked.connect(self.benchmark_clicked)
         self.system_button = QPushButton('System')
         self.system_button.setVisible(False)
         self.commands_button = QPushButton('Commands')
@@ -94,6 +98,7 @@ class LeftPanel(QWidget):
         controls_layout.addWidget(self.status_label)
         controls_layout.addStretch(1)
         controls_layout.addWidget(self.tuning_wizard_button)
+        controls_layout.addWidget(self.benchmark_button)
         controls_layout.addWidget(self.system_button)
         controls_layout.addWidget(self.commands_button)
         controls_layout.addWidget(self.help_button)
@@ -135,6 +140,7 @@ class LeftPanel(QWidget):
             self.tuning_wizard_button.setEnabled(True)  # Cancel must always be enabled
             self.load_button.setEnabled(False)
             self.unload_button.setEnabled(False)
+            self.benchmark_button.setEnabled(False)
         else:
             self.tuning_wizard_button.setText("Tune Model")
             self.tuning_wizard_button.setStyleSheet("font-weight: bold;")
@@ -212,6 +218,7 @@ class LeftPanel(QWidget):
         self.load_button.setEnabled(can_load)
         self.unload_button.setEnabled(is_running)
         self.tuning_wizard_button.setEnabled(can_load)
+        self.benchmark_button.setEnabled(can_load)
 
     def populate_dropdown(self, model_names):
         self.model_dropdown.blockSignals(True)

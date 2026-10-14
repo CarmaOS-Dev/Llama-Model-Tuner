@@ -1,11 +1,13 @@
 # Llamacpp_Model_launcher/tuning_wizard.py
 
 import time
+import statistics
 import requests
 import re
 import math
 from Llamacpp_Model_launcher.parameters_db import BENCHMARK_PROMPT
 from Llamacpp_Model_launcher.core.platform_utils import IS_MACOS
+from Llamacpp_Model_launcher.core.gguf_reader import get_model_features
 
 try:
     import psutil
@@ -20,6 +22,10 @@ class TuningWizard:
     # --- CONFIGURATION ---
     MATH_ESTIMATION_SAFETY_MARGIN = 0.35
     SYSTEM_SAFETY_BUFFER_GB = 0.5
+    BENCHMARK_RUNS = 3
+    BENCHMARK_MAX_TOKENS = 256
+    # A sweep candidate must beat the current best by this factor to be adopted (filters run-to-run noise).
+    SWEEP_MIN_GAIN = 1.02
 
     def __init__(self, analysis_results, initial_params, host='127.0.0.1', port='8080'):
         self.analysis = analysis_results
@@ -44,11 +50,12 @@ class TuningWizard:
             model_size_gb = 15.0
 
         if test_type == 'benchmark':
-            base_ms = 60 * 1000
+            # Load time + 1 warm-up + BENCHMARK_RUNS generations of BENCHMARK_MAX_TOKENS tokens
+            base_ms = 120 * 1000
         else:
             base_ms = 45 * 1000
 
-        per_gb_ms = 10 * 1000
+        per_gb_ms = 12 * 1000 if test_type == 'benchmark' else 10 * 1000
         calculated_timeout = base_ms + (model_size_gb * per_gb_ms)
         min_timeout_ms = 60 * 1000
         max_timeout_ms = 20 * 60 * 1000
@@ -194,20 +201,43 @@ class TuningWizard:
         """The main generator that dispatches tasks based on user choices."""
         yield {'action': 'log', 'message': "\n" + "=" * 25 + " Starting Tuning Wizard " + "=" * 25}
 
+        # Memory mapping flags were merged into --load-mode (-lm) in recent llama.cpp builds;
+        # --no-mmap/--mlock now make llama-server refuse to start. Keep the user's mode if set.
+        current_load_mode = self.initial_params.get('-lm') or self.initial_params.get('--load-mode')
         proposed_optimizations = [
             {'id': 'np_1', 'label': 'Set Parallel Sequences to 1 (-np 1)', 'checked': True,
              'params': {'-np': '1'}},
-            {'id': 'fit_off', 'label': 'Disable Context Fitting (-fit off)', 'checked': True,
+            {'id': 'fit_off', 'label': 'Disable Automatic Fitting (-fit off, the wizard does the fitting)', 'checked': True,
              'params': {'-fit': 'off'}},
-            {'id': 'flash_attn', 'label': 'Enable Flash Attention (--flash-attn)', 'checked': True,
+            {'id': 'flash_attn', 'label': 'Enable Flash Attention (--flash-attn on)', 'checked': True,
              'params': {'--flash-attn': 'on'}},
-            {'id': 'no_mmap', 'label': 'Disable Memory Mapping (--no-mmap)', 'checked': True,
-             'params': {'--no-mmap': None}},
+            {'id': 'load_mode',
+             'label': (f'Keep Load Mode (-lm {current_load_mode})' if current_load_mode
+                       else 'Load Without Memory Mapping (-lm none)'), 'checked': True,
+             'params': {'-lm': current_load_mode or 'none', '--load-mode': 'REMOVE',
+                        '--no-mmap': 'REMOVE', '--mlock': 'REMOVE'}},
             {'id': 'kv_cache_q8', 'label': 'Enable 8-bit KV Cache (-ctk/-ctv q8_0)', 'checked': True,
              'params': {'-ctk': 'q8_0', '-ctv': 'q8_0'}},
             {'id': 'no_warmup', 'label': 'Disable Server Warmup (--no-warmup)', 'checked': True,
              'params': {'--no-warmup': None}},
         ]
+
+        # --- GGUF metadata (instant, no server launch) ---
+        model_path_raw = self.initial_params.get('-m', self.initial_params.get('--model', ''))
+        features = get_model_features(model_path_raw) if model_path_raw else None
+        self.analysis['model_has_mtp'] = bool(features and features.has_mtp)
+        if features and features.is_valid:
+            yield {'action': 'log', 'message': f"> GGUF: architecture '{features.architecture}', "
+                                               f"{features.block_count} blocks, "
+                                               f"{features.expert_count or 'no'} experts, "
+                                               f"MTP layers: {features.mtp_layers}"}
+        has_spec_type = '--spec-type' in self.initial_params
+        if self.analysis['model_has_mtp'] and not has_spec_type and not (
+                '-md' in self.initial_params or '--model-draft' in self.initial_params):
+            yield {'action': 'log', 'message': "> Model has Multi-Token-Prediction layers. Proposing MTP speculative decoding."}
+            proposed_optimizations.append(
+                {'id': 'mtp', 'label': 'Enable MTP Speculative Decoding (--spec-type draft-mtp, 3 tokens)',
+                 'checked': True, 'params': {'--spec-type': 'draft-mtp', '--spec-draft-n-max': '3'}})
 
         # Check for gpt-oss and VRAM fit
         model_path = self.initial_params.get('-m', self.initial_params.get('--model', '')).lower()
@@ -225,14 +255,7 @@ class TuningWizard:
         has_draft_model = '-md' in self.initial_params or '--model-draft' in self.initial_params
         if has_draft_model:
             yield {'action': 'log', 'message': "> Draft model detected. Proposing speculative decoding optimizations."}
-            proposed_optimizations.extend([
-                {'id': 'draft_offload', 'label': 'Fully Offload Draft Model (-ngld 99)', 'checked': True,
-                 'params': {'-ngld': '99'}},
-                {'id': 'draft_kv_cache', 'label': 'Enable 8-bit KV Cache for Draft Model', 'checked': True,
-                 'params': {'--cache-type-k-draft': 'q8_0', '--cache-type-v-draft': 'q8_0'}},
-                {'id': 'ctx_draft_4096', 'label': 'Set Draft Context to 4096 (-cd 4096)', 'checked': True,
-                 'params': {'-cd': '4096'}}
-            ])
+            proposed_optimizations.extend(self._draft_model_optimizations())
 
         yield {'action': 'log', 'message': "\n[PHASE 1] Extracting Model Metadata..."}
         extraction_params = {'--no-warmup': None, '-ngl': '1', '-c': '4096', '-lv': '4'}
@@ -257,11 +280,9 @@ class TuningWizard:
                 # Check if draft opts are already in the list to avoid duplicates
                 if not any(opt['id'] == 'draft_offload' for opt in proposed_optimizations):
                     yield {'action': 'log', 'message': "> Draft model detected (via prompt). Adding speculative decoding optimizations."}
-                    proposed_optimizations.extend([
-                        {'id': 'draft_offload', 'label': 'Fully Offload Draft Model (-ngld 99)', 'checked': True, 'params': {'-ngld': '99'}},
-                        {'id': 'draft_kv_cache', 'label': 'Enable 8-bit KV Cache for Draft Model', 'checked': True, 'params': {'--cache-type-k-draft': 'q8_0', '--cache-type-v-draft': 'q8_0'}},
-                        {'id': 'ctx_draft_4096', 'label': 'Set Draft Context to 4096 (-cd 4096)', 'checked': True, 'params': {'-cd': '4096'}}
-                    ])
+                    proposed_optimizations[:] = [o for o in proposed_optimizations if o['id'] != 'mtp']
+                    proposed_optimizations.extend(self._draft_model_optimizations())
+                    has_draft_model = True
             self.analysis['model_layers'] = metadata_result.get('layers', 0)
             self.analysis['model_max_context'] = metadata_result.get('max_context', 32768)
             self.analysis['proposed_optimizations'] = proposed_optimizations
@@ -284,8 +305,9 @@ class TuningWizard:
         # --- PROBE LOGIC (Moved before UI) ---
         yield {'action': 'log', 'message': "\n[PHASE 2] Probing KV Cache Cost..."}
         probe_ngl = self._calculate_safe_probe_ngl()
-        # Force f16 to get a clean baseline for the dynamic UI logic
-        params_probe = {'-ngl': probe_ngl, '-c': '4096', '-ctk': 'f16', '-ctv': 'f16', '-lv': '4'}
+        # Force f16 to get a clean baseline for the dynamic UI logic. -np 1 keeps the KV
+        # layout deterministic now that llama-server defaults to an automatic slot count.
+        params_probe = {'-ngl': probe_ngl, '-c': '4096', '-ctk': 'f16', '-ctv': 'f16', '-lv': '4', '-np': '1'}
         yield {'action': 'update_params', 'params': params_probe}
         timeout = self._calculate_dynamic_timeout('probe')
         yield {'action': 'probe_kv_stats', 'timeout_ms': timeout}
@@ -601,8 +623,15 @@ class TuningWizard:
             yield {'action': 'log', 'message': "[CRITICAL] Final configuration was unstable. Tuning aborted."}
             return
 
+        sweep_choices = user_choices.get('sweep') or {}
+        if sweep_choices.get('enabled'):
+            final_params, benchmark_result = yield from self._run_performance_sweep(
+                final_params, benchmark_result, sweep_choices, strategy)
+            # Leave the editor on the winning configuration before it is snapshotted.
+            yield {'action': 'update_params', 'params': {**self.base_params, **final_params}}
+
         yield {'action': 'log', 'message': "\n" + "=" * 27 + " Tuning Complete " + "=" * 28}
-        yield {'action': 'log', 'message': f"Best Performance Found: {benchmark_result['tps']:.2f} t/s"}
+        yield {'action': 'log', 'message': f"Best Performance Found: {self._format_result(benchmark_result)}"}
         self.best_config = {'params': final_params, 'tps': benchmark_result['tps']}
         yield {'action': 'save_best_params'}
 
@@ -1316,7 +1345,46 @@ class TuningWizard:
         return None
 
     # --- RESTORED UTILITY METHODS ---
-    def _run_final_benchmark(self, params_to_test):
+    def _draft_model_optimizations(self):
+        """Optimizations proposed when a separate draft model (-md) is configured."""
+        draft_path = self.initial_params.get('-md', self.initial_params.get('--model-draft', ''))
+        spec_type = self.spec_type_for_draft(draft_path)
+        opts = [
+            {'id': 'draft_offload', 'label': 'Fully Offload Draft Model (-ngld 99)', 'checked': True,
+             'params': {'-ngld': '99'}},
+            {'id': 'draft_kv_cache', 'label': 'Enable 8-bit KV Cache for Draft Model', 'checked': True,
+             'params': {'--cache-type-k-draft': 'q8_0', '--cache-type-v-draft': 'q8_0'}},
+        ]
+        if '--spec-type' not in self.initial_params:
+            opts.append({'id': 'draft_spec_type', 'label': f'Set Speculative Type (--spec-type {spec_type})',
+                         'checked': True, 'params': {'--spec-type': spec_type}})
+        return opts
+
+    @staticmethod
+    def spec_type_for_draft(draft_path):
+        """Chooses the --spec-type matching a draft GGUF (DFlash, EAGLE3, MTP head or a classic draft)."""
+        features = get_model_features(draft_path) if draft_path else None
+        arch = (features.architecture if features else '').lower()
+        if 'dflash' in arch:
+            return 'draft-dflash'
+        if 'dspark' in arch:
+            return 'draft-dspark'
+        if 'eagle' in arch:
+            return 'draft-eagle3'
+        if features and features.has_mtp:
+            return 'draft-mtp'
+        return 'draft-simple'
+
+    @staticmethod
+    def _format_result(result):
+        text = f"TG {result.get('tps', 0.0):.2f} t/s"
+        if result.get('pp_tps'):
+            text += f" | PP {result['pp_tps']:.1f} t/s"
+        if result.get('draft_acceptance') is not None:
+            text += f" | draft acceptance {result['draft_acceptance'] * 100:.0f}%"
+        return text
+
+    def _run_final_benchmark(self, params_to_test, label='Final configuration'):
         final_benchmark_params = params_to_test.copy()
         try:
             if int(final_benchmark_params.get('-c', 0)) < 4096:
@@ -1327,12 +1395,186 @@ class TuningWizard:
             yield {'action': 'log', 'message': "> Forcing benchmark context to 4096 for stability."}
         yield {'action': 'update_params', 'params': {**self.base_params, **final_benchmark_params}}
         timeout = self._calculate_dynamic_timeout('benchmark')
-        benchmark_result = yield {'action': 'load_and_benchmark', 'timeout_ms': timeout}
+        benchmark_result = yield {'action': 'load_and_benchmark', 'timeout_ms': timeout, 'label': label}
         if benchmark_result['success']:
-            return {'success': True, 'tps': benchmark_result.get('avg_tps', 0.0)}
+            result = {'success': True, 'tps': benchmark_result.get('avg_tps', 0.0),
+                      'pp_tps': benchmark_result.get('pp_tps', 0.0),
+                      'draft_acceptance': benchmark_result.get('draft_acceptance')}
+            yield {'action': 'log', 'message': f"> Benchmark: {self._format_result(result)}"}
+            return result
         else:
-            yield {'action': 'log', 'message': f"> BENCHMARK FAILED: {benchmark_result['error']}"}
+            yield {'action': 'log', 'message': f"> BENCHMARK FAILED: {benchmark_result.get('error', 'unknown error')}"}
             return {'success': False, 'tps': 0.0}
+
+    # --- PHASE 6: PERFORMANCE SWEEP ---
+    @staticmethod
+    def _get_param(params, *aliases, default=None):
+        for alias in aliases:
+            if alias in params and params[alias] != 'REMOVE':
+                return params[alias]
+        return default
+
+    def _sweep_score(self, result, metric):
+        tg, pp = result.get('tps', 0.0), result.get('pp_tps', 0.0)
+        if metric == 'pp':
+            return pp
+        if metric == 'balanced':
+            # Geometric mean: a 10% gain in either metric counts the same regardless of scale
+            return math.sqrt(max(tg, 0.0) * max(pp, 0.0))
+        return tg
+
+    def _uses_cpu_offload(self, params, strategy):
+        if strategy == 'multi_cpu':
+            return True
+        if any(key in params and params[key] != 'REMOVE' for key in ('-cmoe', '--cpu-moe')):
+            return True
+        for key in ('-ncmoe', '--n-cpu-moe', '-ncffn', '--n-cpu-ffn'):
+            try:
+                if int(params.get(key, 0)) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        try:
+            return int(self._get_param(params, '-ngl', '--n-gpu-layers', default='999')) < self.analysis.get('model_layers', 0)
+        except (TypeError, ValueError):
+            return False
+
+    def _build_sweep_dimensions(self, params, sweep, strategy):
+        """Returns [(dimension name, [(candidate label, overrides dict), ...]), ...] based on current params."""
+        dims = []
+        gpus = self.analysis.get('gpus', [])
+
+        # 1. Split mode: 'tensor' runs both GPUs in parallel instead of pipelining layers
+        current_sm = self._get_param(params, '-sm', '--split-mode', default='layer')
+        if sweep.get('split_mode') and len(gpus) > 1 and current_sm != 'none':
+            dims.append(('Split mode', [(f'-sm {m}', {'-sm': m, '--split-mode': 'REMOVE'})
+                                        for m in ('layer', 'tensor') if m != current_sm]))
+
+        # 2. Speculative decoding depth (MTP head or draft model)
+        if sweep.get('speculative'):
+            draft = self._get_param(params, '-md', '--model-draft') or \
+                    self.initial_params.get('-md', self.initial_params.get('--model-draft'))
+            spec_keys = {'--spec-type': 'REMOVE', '--spec-draft-n-max': 'REMOVE',
+                         '--draft': 'REMOVE', '--draft-max': 'REMOVE'}
+            current_n = self._get_param(params, '--spec-draft-n-max', default=None)
+            current_type = self._get_param(params, '--spec-type', default=None)
+            candidates = []
+            if draft:
+                spec_type = current_type or self.spec_type_for_draft(draft)
+                for n in (2, 4, 6, 8, 12):
+                    if str(n) != str(current_n):
+                        candidates.append((f'{spec_type} n-max {n}',
+                                           {**spec_keys, '--spec-type': spec_type, '--spec-draft-n-max': str(n)}))
+            elif self.analysis.get('model_has_mtp'):
+                if current_type:
+                    candidates.append(('speculative off', dict(spec_keys)))
+                for n in (1, 2, 3, 4, 5):
+                    if not (current_type == 'draft-mtp' and str(n) == str(current_n or 3)):
+                        candidates.append((f'draft-mtp n-max {n}',
+                                           {**spec_keys, '--spec-type': 'draft-mtp', '--spec-draft-n-max': str(n)}))
+            if candidates:
+                dims.append(('Speculative decoding', candidates))
+
+        # 3. Micro-batch size: mostly affects prompt processing speed
+        if sweep.get('ubatch'):
+            current_ub = str(self._get_param(params, '-ub', '--ubatch-size', default='512'))
+            try:
+                current_b = int(self._get_param(params, '-b', '--batch-size', default='2048'))
+            except (TypeError, ValueError):
+                current_b = 2048
+            dims.append(('Micro-batch (-ub)', [
+                (f'-ub {ub}', {'-ub': str(ub), '--ubatch-size': 'REMOVE', '--batch-size': 'REMOVE',
+                               '-b': str(max(current_b, ub))})
+                for ub in (256, 512, 1024, 2048) if str(ub) != current_ub]))
+
+        # 4. CPU threads: only matters when weights live in system RAM
+        if sweep.get('threads') and self._uses_cpu_offload(params, strategy):
+            physical = self.analysis.get('cpu_physical_cores') or 0
+            logical = self.analysis.get('cpu_logical_cores') or 0
+            # On hybrid Intel CPUs only P-cores have Hyper-Threading: logical - physical = P-core count.
+            p_cores = logical - physical if logical and physical and logical > physical else 0
+            current_t = self._get_param(params, '-t', '--threads', default='-1')
+            current_label = 'auto' if str(current_t) == '-1' else f'-t {current_t}'
+            options = [('auto', {'-t': 'REMOVE', '--threads': 'REMOVE'})]
+            for n in sorted({n for n in (p_cores, physical) if n}):
+                options.append((f'-t {n}', {'-t': str(n), '--threads': 'REMOVE'}))
+            dims.append(('CPU threads', [o for o in options if o[0] != current_label]))
+
+        # 5. Backend (GPU) sampling: experimental, can save a few ms per token
+        if sweep.get('backend_sampling'):
+            if '-bs' in params or '--backend-sampling' in params:
+                dims.append(('Backend sampling', [('backend sampling off', {'-bs': 'REMOVE', '--backend-sampling': 'REMOVE'})]))
+            else:
+                dims.append(('Backend sampling', [('backend sampling on (-bs)', {'-bs': None})]))
+
+        return [d for d in dims if d[1]]
+
+    def _run_performance_sweep(self, final_params, baseline, sweep, strategy):
+        """Coordinate-descent search over speed-related flags, keeping the found context size."""
+        metric = sweep.get('metric', 'tg')
+        metric_name = {'tg': 'generation speed', 'pp': 'prompt processing speed', 'balanced': 'balanced pp/tg'}[metric]
+        yield {'action': 'log', 'message': f"\n[PHASE 6] Performance Sweep (ranking by {metric_name})..."}
+
+        best_params = final_params.copy()
+        best_result = baseline
+        best_score = self._sweep_score(baseline, metric)
+        rows = [('baseline', baseline)]
+        # Every key a candidate ever set. The editor only adds/overrides keys, so a losing candidate's
+        # flag (e.g. '-sm tensor') would leak into later tests unless explicitly removed again.
+        touched_keys = set()
+
+        def with_resets(params):
+            # Restore the user's original value (e.g. their own -ub 512) rather than deleting it
+            resets = {k: self.initial_params.get(k, 'REMOVE') for k in touched_keys if k not in params}
+            return {**resets, **params}
+
+        dimension_names = [name for name, _ in self._build_sweep_dimensions(best_params, sweep, strategy)]
+        for dim_name in dimension_names:
+            # Rebuild candidates from the current best so each dimension starts from the winner so far
+            candidates = dict(self._build_sweep_dimensions(best_params, sweep, strategy)).get(dim_name, [])
+            if not candidates:
+                continue
+            yield {'action': 'log', 'message': f"\n> Sweep dimension: {dim_name} ({len(candidates)} candidate(s))"}
+            dim_winner = None
+            for label, overrides in candidates:
+                touched_keys.update(overrides)
+                candidate_params = with_resets({**best_params, **overrides})
+                yield {'action': 'log', 'message': f"> Testing: {label}"}
+                result = yield from self._run_final_benchmark(candidate_params, label=f'Sweep: {label}')
+                if not result['success']:
+                    rows.append((label, None))
+                    continue
+                rows.append((label, result))
+                score = self._sweep_score(result, metric)
+                if score > best_score * self.SWEEP_MIN_GAIN:
+                    yield {'action': 'log', 'message': f"  > New best ({best_score:.2f} -> {score:.2f})."}
+                    best_score, best_result, best_params = score, result, candidate_params
+                    dim_winner = label
+            if dim_winner:
+                yield {'action': 'log', 'message': f"> {dim_name}: keeping '{dim_winner}'."}
+            else:
+                yield {'action': 'log', 'message': f"> {dim_name}: no candidate beat the current settings."}
+
+        # Results table
+        table = ["\n" + "-" * 25 + " Sweep Results " + "-" * 25,
+                 f"{'Configuration':<34}{'PP t/s':>10}{'TG t/s':>10}{'Draft acc.':>12}"]
+        for label, res in rows:
+            if res is None:
+                table.append(f"{label:<34}{'failed (OOM / crash)':>32}")
+                continue
+            acc = res.get('draft_acceptance')
+            table.append(f"{label:<34}{res.get('pp_tps', 0.0):>10.1f}{res.get('tps', 0.0):>10.2f}"
+                         f"{(f'{acc * 100:.0f}%' if acc is not None else '-'):>12}")
+        yield {'action': 'log', 'message': "\n".join(table)}
+
+        changes = {k: v for k, v in best_params.items() if final_params.get(k) != v and v != 'REMOVE'}
+        removed = [k for k, v in best_params.items() if v == 'REMOVE' and k in final_params]
+        if changes or removed:
+            yield {'action': 'log', 'message': f"> Sweep improved the configuration. Changes: {changes or ''} "
+                                               f"{('removed: ' + ', '.join(removed)) if removed else ''}"}
+        else:
+            yield {'action': 'log', 'message': "> The tuned configuration was already the fastest tested."}
+        return with_resets(best_params), best_result
 
     def _get_best_gpu_id(self):
         gpus = self.analysis.get('gpus', [])
@@ -1431,16 +1673,72 @@ class TuningWizard:
         return ordered_proportions
 
     def run_api_benchmark_requests(self):
+        """
+        Measures prompt processing (pp) and generation (tg) speed through the server API.
+
+        Uses the exact `timings` object llama-server returns with every completion instead of
+        scraping the log (log lines are now prefixed with timestamps, which broke the old regex).
+        cache_prompt=false forces the prompt to be processed every run so pp is real.
+        Returns a summary dict consumed by MainWindow._on_api_benchmark_result.
+        """
         url = f"http://{self.host}:{self.port}/v1/chat/completions"
-        for i in range(3):
+        base_payload = {"messages": [{"role": "user", "content": BENCHMARK_PROMPT}],
+                        "seed": 1, "cache_prompt": False}
+        errors = []
+        try:
+            # Warm-up: the first request after load pays for graph/kernel setup
+            requests.post(url, json={**base_payload, "n_predict": 16}, timeout=600)
+        except requests.RequestException as e:
+            errors.append(f"warm-up: {e}")
+
+        samples = []
+        for i in range(self.BENCHMARK_RUNS):
+            started = time.perf_counter()
             try:
-                requests.post(url,
-                              json={"messages": [{"role": "user", "content": BENCHMARK_PROMPT}], "n_predict": 512,
-                                    "temperature": 0.1, "seed": 1}, timeout=120)
-                if i < 2: time.sleep(2)
-            except requests.RequestException as e:
-                print(f"[DIAGNOSTICS] API request {i + 1} failed: {e}");
-                pass
+                response = requests.post(url, json={**base_payload, "n_predict": self.BENCHMARK_MAX_TOKENS},
+                                         timeout=900)
+                elapsed = time.perf_counter() - started
+                data = response.json()
+            except (requests.RequestException, ValueError) as e:
+                errors.append(f"run {i + 1}: {e}")
+                print(f"[DIAGNOSTICS] API request {i + 1} failed: {e}")
+                continue
+            sample = self._sample_from_response(data, elapsed)
+            if sample:
+                samples.append(sample)
+                print(f"[DIAGNOSTICS] Benchmark run {i + 1}: {sample}")
+            else:
+                errors.append(f"run {i + 1}: response without usable timings")
+        return self.summarize_benchmark(samples, errors)
+
+    @staticmethod
+    def _sample_from_response(data, elapsed_s):
+        timings = data.get('timings') or {}
+        usage = data.get('usage') or {}
+        predicted_n = timings.get('predicted_n') or usage.get('completion_tokens') or 0
+        tg = timings.get('predicted_per_second')
+        if not tg and predicted_n and elapsed_s > 0:
+            tg = predicted_n / elapsed_s  # Fallback: wall clock (includes prompt time, so pessimistic)
+        if not tg or predicted_n < 8:
+            return None
+        return {'tg': float(tg), 'pp': float(timings.get('prompt_per_second') or 0.0),
+                'prompt_n': timings.get('prompt_n', 0), 'predicted_n': predicted_n,
+                'draft_n': timings.get('draft_n', 0) or 0, 'draft_accepted': timings.get('draft_n_accepted', 0) or 0}
+
+    @staticmethod
+    def summarize_benchmark(samples, errors=()):
+        if not samples:
+            return {'success': False, 'error': '; '.join(errors) or 'no successful benchmark request'}
+        draft_n = sum(s['draft_n'] for s in samples)
+        return {
+            'success': True,
+            'avg_tps': statistics.median(s['tg'] for s in samples),
+            'pp_tps': statistics.median(s['pp'] for s in samples),
+            'draft_acceptance': (sum(s['draft_accepted'] for s in samples) / draft_n) if draft_n else None,
+            'runs': len(samples),
+            'prompt_tokens': samples[0]['prompt_n'],
+            'error': '',
+        }
 
     def run_stability_api_request(self):
         url = f"http://{self.host}:{self.port}/v1/chat/completions"

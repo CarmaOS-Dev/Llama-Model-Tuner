@@ -279,6 +279,24 @@ You can create your own model_file.txt from scratch or save the model_file_examp
 
 ##   Change Log
 
+*   10/14/2026 - **llama.cpp b10903 sync + performance testing tools (v0.56)**
+    *   **Critical fixes for current llama.cpp builds**
+        *   The Tuning Wizard proposed `--no-mmap` by default — recent llama-server builds **refuse to start** with it (`--no-mmap`/`--mmap`/`--mlock` were merged into `-lm/--load-mode`). Now proposes `-lm none`, or keeps your own `-lm` (e.g. `dio`)
+        *   The final benchmark never collected a speed value: log lines now start with a timestamp, so the old `^eval time` regex never matched and the benchmark always timed out. Speed is now read from the exact `timings` object returned by the server API
+        *   The draft-model optimization `-cd 4096` no longer exists (server refused to start); removed
+    *   **Automatic compatibility with your llama.cpp build** — the launcher reads `llama-server --help` from your llama.cpp folder:
+        *   Obsolete flags are migrated on load (`--no-mmap` → `-lm none`, `--mlock` → `-lm mlock`, `--draft` → `--spec-draft-n-max`, `--draft-min` → `--spec-draft-n-min`, `--context-shift disabled` → `--no-context-shift`, ...) and the editor is updated so you can Save the fixed command
+        *   Warning for any flag your build does not recognise; duplicated aliases (`-sm` + `--split-mode`) are collapsed
+        *   The Commands browser shows a **"Detected in your llama.cpp build"** group with every flag the built-in database does not know yet, so future llama.cpp features appear without updating the launcher
+    *   **Parameter database rewritten for build 10903** — 14 invalid flags removed, new groups for the performance features: `-sm tensor`, `-fit`/`-fitt`/`-fitc`, `-ngl auto|all`, `-ncffn`, `--no-host`, `-lm`/`-lzm`, `--spec-type` (MTP, draft, EAGLE3, DFlash, n-gram), `-bs` backend sampling, `-cram`/`-ctxcp`/`-cms` prompt cache & checkpoints, `-rea`/`--reasoning-effort`, `-mmdev`, `--image-max-tokens`, router mode, agent tools/MCP, and corrected defaults
+    *   **Tuning Wizard Phase 6 — Performance Sweep**: after offload and context are found, benchmarks `-sm layer` vs `tensor`, MTP/draft depth (`--spec-draft-n-max`), micro-batch `-ub`, CPU threads (with CPU offload) and backend sampling, keeping the fastest by your chosen metric (generation, prompt processing or balanced). Out-of-memory candidates are skipped safely
+    *   **Better measurements** — 1 warm-up + 3 runs with prompt cache disabled, median of generation (TG) and prompt processing (PP) t/s plus draft acceptance rate. Every result is appended to `benchmark_history.jsonl`
+    *   **MTP detection from GGUF metadata** — a tiny GGUF header reader detects Multi-Token-Prediction layers (`--spec-type draft-mtp` crashes the server on models without them), MoE experts and the right `--spec-type` for draft models (DFlash, EAGLE3, MTP assistant). Model architecture no longer guessed from the file name
+    *   **New Benchmark button (llama-bench)** — sweep dialog pre-filled from the selected model: comma lists/ranges for `-sm`, `-ub`, `-fa`, `-ctk/-ctv`, `-t`, `-ncmoe`, `-d` (context depth)... with a sortable pp/tg table and **Apply Best to Editor**
+    *   Tuning Assistant panel is now scrollable; KV probe uses `-np 1` (llama-server now defaults to automatic slots)
+
+    > 🤖 All changes implemented by Claude Code (Claude Opus 5.5)
+
 *   08/18/2026 -
     *   **Critical fix: deleting a profile wiped the env vars of other profiles** — after deleting any profile, most of the *other* profiles lost their environment variables and had to be re-added/saved manually.
         *   Root cause: `delete_model()` kept a `found` flag true for the rest of the file and skipped **every** `env:`/`llamacppdir:` line appearing after the deleted profile — including the ones belonging to unrelated profiles below it

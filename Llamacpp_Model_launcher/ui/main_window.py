@@ -19,6 +19,7 @@ from Llamacpp_Model_launcher.core import (
 )
 from Llamacpp_Model_launcher.core.platform_utils import IS_WINDOWS, IS_MACOS, get_executable_name, get_default_model_path_example, kill_process_tree, is_ninfer_command, is_ninfer_params
 from Llamacpp_Model_launcher.core.workers import ApiRequestWorker, StabilityRequestWorker
+from Llamacpp_Model_launcher.core import llama_cli, benchmark_history
 
 from Llamacpp_Model_launcher.system_analyzer import SystemAnalyzer
 from Llamacpp_Model_launcher.tuning_wizard import TuningWizard
@@ -61,9 +62,10 @@ class MainWindow(QWidget):
         self.detected_gpu_usage_mib = {}
 
         # REGEX DEFINITIONS
+        # Recent builds prefix every log line with a timestamp and "slot print_timing: ... |",
+        # so the line can no longer be anchored at its start. "prompt eval time" must not match.
         self.tps_regex = re.compile(
-            r"^\s*eval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens\s*\([\s\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second\)",
-            re.MULTILINE
+            r"(?<!prompt )\beval time\s*=\s*[\d.]+\s*ms\s*/\s*\d+\s*tokens\s*\([\s\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second\)"
         )
         self.idle_regex = re.compile(r"all slots are idle", re.IGNORECASE)
         self.layer_count_regex = re.compile(r"n_layer\s*=\s*(\d+)", re.IGNORECASE)
@@ -154,6 +156,7 @@ class MainWindow(QWidget):
         self.left_panel.unload_model_clicked.connect(self.unload_model)
         self.left_panel.tune_model_clicked.connect(self.start_tuning_wizard)
         self.left_panel.tune_model_cancelled.connect(self._cancel_tuning_wizard)
+        self.left_panel.benchmark_clicked.connect(self.open_benchmark_dialog)
         self.left_panel.exit_clicked.connect(self.close)
         self.left_panel.webui_toggled.connect(self.update_auto_open_visibility)
         self.left_panel.parameter_browser.parameter_add_requested.connect(self.add_parameter_from_browser)
@@ -437,8 +440,10 @@ class MainWindow(QWidget):
                                     self._update_editor_params({'--mmproj': mmproj_file})
                                     self.wizard.initial_params['--mmproj'] = mmproj_file
 
-                        # 2. Draft Model Check (Dense)
-                        if not self.wizard_found_expert_count and '-md' not in current_params and '--model-draft' not in current_params:
+                        # 2. Draft Model Check (Dense). Skipped when the model brings its own MTP head
+                        # or speculative decoding is already configured (--spec-type).
+                        has_own_spec = self.analysis_results.get('model_has_mtp') or '--spec-type' in current_params
+                        if not self.wizard_found_expert_count and not has_own_spec and '-md' not in current_params and '--model-draft' not in current_params:
                             reply = QMessageBox.question(
                                 self, "Speculative Decoding", 
                                 "This model appears to be Dense (Non-MoE).\nDo you want to select a Draft Model for Speculative Decoding optimization?",
@@ -643,6 +648,8 @@ class MainWindow(QWidget):
             else:  # load_and_benchmark
                 self.wizard_current_is_viability_check = False
                 self.wizard_current_timeout = action.get('timeout_ms', 300000)
+                self.wizard_benchmark_label = action.get('label', '')
+                self._benchmark_result_pending = False
 
             self.load_model()
             self._setup_benchmark_timer()
@@ -696,6 +703,7 @@ class MainWindow(QWidget):
         llamacpp_dirs = self.model_manager._get_model_llamacppdirs()
         self.current_model_llamacppdir = llamacpp_dirs.get(model_name, "")
         self.right_panel.set_llamacpp_dir(self.current_model_llamacppdir)
+        self._refresh_parameter_browser_extras()
 
     def _on_llamacpp_dir_changed(self, new_dir):
         """Track the per-model directory as the user types/browses."""
@@ -835,6 +843,7 @@ class MainWindow(QWidget):
             self.config_manager.save_config(self.llamacpp_dir, self.models_file)
             self.update_path_labels();
             self.update_button_states()
+            self._refresh_parameter_browser_extras()
 
     def browse_models_file(self):
         file, _ = QFileDialog.getOpenFileName(self, "Select Models Command File", "", "Text Files (*.txt)")
@@ -997,7 +1006,18 @@ class MainWindow(QWidget):
         if not effective_dir: QMessageBox.warning(self, "Warning", "Set the Llama.cpp directory first."); return
         params_from_editor = self.right_panel.get_parameters()
         is_ninfer = is_ninfer_params(params_from_editor)
-        command_str = self.command_builder.build(params_from_editor, is_ninfer=is_ninfer)
+        compat_notes, unsupported = [], []
+        if not is_ninfer:
+            params_from_editor, compat_notes, unsupported = self._apply_build_compatibility(params_from_editor)
+        # Launch with an absolute executable path: cmd.exe skips the working directory when
+        # NoDefaultCurrentDirectoryInExePath is set, which made bare "llama-server.exe" unresolvable.
+        launch_params = [
+            Parameter(p.key, os.path.normpath(os.path.join(effective_dir, p.value)))
+            if p.key == 'Executable' and p.value and not os.path.isabs(p.value)
+            and os.path.isfile(os.path.join(effective_dir, p.value)) else p
+            for p in params_from_editor
+        ]
+        command_str = self.command_builder.build(launch_params, is_ninfer=is_ninfer)
         if not command_str: QMessageBox.warning(self, "Warning", "Command is empty."); return
 
         # --- FIX: Reset KV capture list for new run ---
@@ -1005,6 +1025,12 @@ class MainWindow(QWidget):
 
         log_msg = f"Working Dir: {effective_dir}\nExecuting Command: {command_str}\n\n" + "=" * 80 + "\n"
         if not self.wizard_generator: self.left_panel.clear_output();
+        for note in compat_notes:
+            self.left_panel.append_output(f"[COMPAT] {note}")
+        if unsupported:
+            self.left_panel.append_output(
+                f"[COMPAT WARNING] Not recognised by your llama-server build: {', '.join(unsupported)}. "
+                "The server will probably refuse to start; remove or rename these flags.")
         self.left_panel.append_output(log_msg)
         print(f"\n[DIAGNOSTICS] LAUNCHING SERVER\n[DIAGNOSTICS] > {command_str}\n")
         # Only auto-append --no-webui for Llama.cpp models (NInfer doesn't support it)
@@ -1060,6 +1086,83 @@ class MainWindow(QWidget):
         self.left_panel.set_status(ServerStatus.LOADING);
         self.update_button_states()
 
+    def open_benchmark_dialog(self):
+        if self._is_current_ninfer():
+            QMessageBox.information(self, "Benchmark", "llama-bench is only available for Llama.cpp models.")
+            return
+        effective_dir = self.right_panel.get_llamacpp_dir() or self.llamacpp_dir
+        bench_path = llama_cli.find_tool(effective_dir, 'llama-bench')
+        if not bench_path:
+            QMessageBox.warning(self, "Benchmark", f"llama-bench was not found in:\n{effective_dir}")
+            return
+        if self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning:
+            if QMessageBox.question(self, "Benchmark",
+                                    "A model is currently loaded and uses VRAM. Unload it before benchmarking?",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.Yes) == QMessageBox.StandardButton.Yes:
+                self.unload_model()
+        params, _, _ = self._apply_build_compatibility(self.right_panel.get_parameters())
+        model_params = {p.key: p.value for p in params}
+        from .bench_dialog import BenchDialog
+        dialog = BenchDialog(bench_path, model_params, self.right_panel.get_model_name(), self)
+        dialog.apply_params.connect(self._apply_bench_params)
+        dialog.exec()
+
+    def _apply_bench_params(self, params):
+        """Applies llama-bench winners to the editor, replacing any alias of the same option."""
+        cli_info = self.get_cli_info()
+        updates = {}
+        for flag, value in params.items():
+            entry = cli_info.entry(flag) if cli_info else None
+            for alias in (entry.flags if entry else ()):
+                if alias != flag:
+                    updates[alias] = 'REMOVE'
+            updates[flag] = value
+        self._update_editor_params(updates)
+        self.right_panel._mark_as_dirty()
+
+    def _refresh_parameter_browser_extras(self):
+        """Adds flags from the installed llama-server that parameters_db does not know about yet."""
+        if self._is_current_ninfer():
+            return
+        cli_info = self.get_cli_info()
+        if cli_info is None:
+            return
+        from Llamacpp_Model_launcher.parameters_db import LLAMA_CPP_PARAMETERS
+        known = {p['prefix'] for g in LLAMA_CPP_PARAMETERS for p in g['parameters'] if p['prefix']}
+        self.left_panel.parameter_browser.set_detected_parameters(
+            llama_cli.extra_parameters(cli_info, known), cli_info.build_label)
+
+    def get_cli_info(self):
+        """Parsed `--help` of the llama-server this model would launch (cached; None if unavailable)."""
+        effective_dir = self.right_panel.get_llamacpp_dir() or self.llamacpp_dir
+        executable = next((p.value for p in self.right_panel.get_parameters() if p.key == 'Executable'), '')
+        return llama_cli.get_cli_info(llama_cli.find_server_executable(effective_dir, executable))
+
+    def _apply_build_compatibility(self, params):
+        """
+        Migrates obsolete flags (e.g. --no-mmap -> -lm none) and collapses duplicated aliases for the
+        installed llama.cpp build. The editor is updated too so the user can save the fixed command.
+        Returns (params, notes, unsupported_flags).
+        """
+        cli_info = self.get_cli_info()
+        if cli_info is None:
+            return params, [], []
+        migrated, notes = llama_cli.migrate_parameters(params, cli_info)
+        migrated, dedupe_notes = llama_cli.dedupe_aliases(migrated, cli_info)
+        notes += dedupe_notes
+        if notes:
+            self.right_panel.populate(
+                migrated,
+                self.right_panel.get_model_name(),
+                getattr(self, '_wizard_env_vars', self.right_panel.get_env_vars()),
+                getattr(self, '_wizard_llamacpp_dir', self.right_panel.get_llamacpp_dir()),
+            )
+            if not self.wizard_generator:
+                self.right_panel._mark_as_dirty()
+                notes.append("The editor was updated - press Save to store the fixed command.")
+        return migrated, notes, llama_cli.find_unsupported(migrated, cli_info)
+
     @staticmethod
     def _parse_env_vars_text(env_vars_text, invalid_lines=None):
         """Parses the per-model 'Environment Variables' textbox into (key, value) pairs.
@@ -1107,32 +1210,10 @@ class MainWindow(QWidget):
                 self.left_panel.append_output("[WIZARD] **Detected unstable server signature (soft failure).**")
                 self.wizard_saw_soft_failure_artifact = True
 
-        if self.wizard_is_benchmarking and not self.wizard_current_is_viability_check and len(self.wizard_tps_results) < 3:
-            matches = self.tps_regex.findall(text_to_append)
-            for match in matches:
-                try:
-                    tps_value = float(match)
-                    if tps_value > 5000:
-                        self.log_diagnostic(f"[DIAGNOSTICS] Discarding unrealistic TPS value: {tps_value}")
-                        continue
-                    self.wizard_tps_results.append(tps_value)
-                    log_msg = f"[WIZARD] Found TPS value: {tps_value:.2f}. ({len(self.wizard_tps_results)}/3)"
-                    self.left_panel.append_output(log_msg)
-                    self.log_diagnostic(f"[DIAGNOSTICS] Regex matched: {tps_value:.2f} t/s.")
-
-                    if len(self.wizard_tps_results) >= 3:
-                        if self.benchmark_timeout_timer and self.benchmark_timeout_timer.isActive():
-                            self.benchmark_timeout_timer.stop()
-                        self.left_panel.append_output("[WIZARD] Collected 3 TPS values. Finalizing benchmark.")
-                        self.log_diagnostic("[DIAGNOSTICS] Collected 3/3 TPS values. Calculating average.")
-                        avg_tps = sum(self.wizard_tps_results) / len(self.wizard_tps_results)
-                        result = {'success': True, 'avg_tps': avg_tps, 'error': ''}
-                        current_params_list = [p._asdict() for p in self.right_panel.get_parameters()]
-                        result['params_used'] = dict(current_params_list)
-                        self._handle_benchmark_result(result)
-                        break
-                except (ValueError, IndexError):
-                    pass
+        if self.wizard_is_benchmarking and not self.wizard_current_is_viability_check:
+            # Show the per-request speed lines so the user can follow the benchmark live
+            for match in self.tps_regex.findall(text_to_append):
+                self.left_panel.append_output(f"[WIZARD] Server reported generation speed: {float(match):.2f} t/s")
 
         if self.wizard_awaiting_idle_signal and self.idle_regex.search(text_to_append):
             self.log_diagnostic("[DIAGNOSTICS] Stability check passed ('all slots are idle' detected). Unloading.")
@@ -1350,13 +1431,17 @@ class MainWindow(QWidget):
 
     def _continue_wizard_benchmark(self):
         self.wizard_timer.stop()
-        self.left_panel.append_output("[WIZARD] Triggering 3 API requests for benchmarking...")
+        self.left_panel.append_output(
+            f"[WIZARD] Benchmarking via API: 1 warm-up + {self.wizard.BENCHMARK_RUNS} runs of "
+            f"{self.wizard.BENCHMARK_MAX_TOKENS} tokens (prompt cache disabled)...")
         self.log_diagnostic("[DIAGNOSTICS] Starting ApiRequestWorker thread.")
         self.wizard_tps_results.clear()
+        self._benchmark_result_pending = True
         self.thread = QThread()
         self.worker = ApiRequestWorker(self.wizard)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
+        self.worker.result.connect(self._on_api_benchmark_result)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
@@ -1366,18 +1451,48 @@ class MainWindow(QWidget):
         self.left_panel.append_output(f"[WIZARD] Setting benchmark timeout to {timeout / 1000:.0f} seconds.")
         self.benchmark_timeout_timer.start(timeout)
 
+    def _on_api_benchmark_result(self, result):
+        """Receives the API timing summary from ApiRequestWorker (runs on the GUI thread)."""
+        if not getattr(self, '_benchmark_result_pending', False) or not self.wizard_is_benchmarking:
+            return  # Arrived after a timeout/cancel; already handled.
+        self._benchmark_result_pending = False
+        if result.get('success'):
+            label = getattr(self, 'wizard_benchmark_label', '')
+            acc = result.get('draft_acceptance')
+            self.left_panel.append_output(
+                f"[WIZARD] Measured: TG {result['avg_tps']:.2f} t/s | PP {result.get('pp_tps', 0.0):.1f} t/s"
+                + (f" | draft acceptance {acc * 100:.0f}%" if acc is not None else "")
+                + f" (median of {result.get('runs', 0)} runs)")
+            cli_info = self.get_cli_info()
+            benchmark_history.append_record({
+                'source': 'tuning-wizard',
+                'label': label,
+                'model': self.right_panel.get_model_name(),
+                'build': cli_info.build_label if cli_info else '',
+                'command': self.command_builder.build(self.right_panel.get_parameters()),
+                'tg_tps': round(result['avg_tps'], 2),
+                'pp_tps': round(result.get('pp_tps', 0.0), 1),
+                'draft_acceptance': round(acc, 3) if acc is not None else None,
+                'prompt_tokens': result.get('prompt_tokens'),
+            })
+        self._handle_benchmark_result(result)
+
     def _check_benchmark_timeout(self):
         if self.wizard_is_benchmarking:
             self.benchmark_timeout_timer.stop()
+            log_msg = "[WIZARD ERROR] Step timed out."
             if self.wizard_current_is_viability_check == "layer_extraction":
                 log_msg = "[WIZARD ERROR] Timed out waiting for model metadata."
                 self.unload_model()
             elif self.wizard_current_is_viability_check == "ngl_testing":
                 log_msg = "[WIZARD INFO] NGL test timed out, assuming load failure."
                 self.unload_model()
-            elif len(self.wizard_tps_results) < 3:
+            elif not self.wizard_current_is_viability_check:
                 log_msg = "[WIZARD ERROR] Benchmark timed out."
+                self._benchmark_result_pending = False
                 self._handle_benchmark_result({'success': False, 'error': 'Benchmark timed out'})
+            else:
+                self.unload_model()  # kv/resource probes: process_finished advances the wizard
             self.left_panel.append_output(log_msg)
 
     def _handle_benchmark_result(self, result):
